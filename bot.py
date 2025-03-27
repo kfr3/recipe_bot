@@ -3,26 +3,31 @@ import discord
 from discord.ext import commands
 from dotenv import load_dotenv
 
-load_dotenv()  # Load token from .env file
+load_dotenv()
 
-TOKEN = os.getenv("DISCORD_BOT_TOKEN")
-
-# Define intents - required in the latest version of discord.py
 intents = discord.Intents.default()
-intents.typing = False  # Disable unneeded intents to improve performance
-intents.presences = False
-intents.messages = True  # Allow bot to read messages if necessary for certain commands
+intents.message_content = True
+intents.messages = True  # Allow the bot to receive message events
+intents.guilds = True    # Allow the bot to interact with guilds
 
-bot = commands.Bot(command_prefix="/", intents=intents)  # Pass the intents here
+bot = commands.Bot(command_prefix="/", intents=intents)
 
 @bot.event
 async def on_ready():
-    print(f"We have logged in as {bot.user}")
+    print(f'Logged in as {bot.user}')
+    try:
+        synced = await bot.tree.sync()  # Sync slash commands
+        print(f'Synced {len(synced)} commands')
+    except Exception as e:
+        print(f'Failed to sync commands: {e}')
 
-@bot.command()
-async def hello(ctx):
-    await ctx.send("Hello! This is a basic bot setup.")
+@bot.tree.command(name="ping", description="Responds with Pong!")
+async def ping(interaction: discord.Interaction):
+    await interaction.response.send_message("Pong!")
 
-bot.run(TOKEN)
-
-
+# Get bot token from environment variable and run bot
+bot_token = os.getenv("DISCORD_BOT_TOKEN")
+if not bot_token:
+    raise ValueError("Bot token not found. Please set the DISCORD_BOT_TOKEN environment variable.")
+    
+bot.run(bot_token)

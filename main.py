@@ -1,6 +1,9 @@
 from fastapi import FastAPI, Request
+import discord 
+import os
 
 app = FastAPI()
+client = discord.Client(intents=discord.Intents.default())
 
 @app.post("/interactions")
 async def interactions(request: Request):
