@@ -1,79 +1,181 @@
+from fastapi import FastAPI, HTTPException, Request, Response
+from pydantic import BaseModel
+from typing import List, Dict, Any, Optional
 import os
-import discord
-from discord import app_commands
-from discord.ext import commands
-import requests
-import json
+from .recipe_client import search_recipes_by_ingredients, get_recipe_information
+import nacl.signing
+import nacl.exceptions
+from dotenv import load_dotenv
 
-# Bot setup
-DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-BOT_PREFIX = "!"
-FASTAPI_URL = "http://localhost:8000"  # Your FastAPI server URL
+# Load environment variables
+load_dotenv()
 
-intents = discord.Intents.default()
-intents.message_content = True
-bot = commands.Bot(command_prefix=BOT_PREFIX, intents=intents)
+app = FastAPI()
 
-@bot.event
-async def on_ready():
-    print(f'{bot.user} has connected to Discord!')
-    try:
-        synced = await bot.tree.sync()
-        print(f"Synced {len(synced)} command(s)")
-    except Exception as e:
-        print(f"Failed to sync commands: {e}")
+# Define the request model - IMPORTANT: This needs to be defined BEFORE using it
+class RecipeRequest(BaseModel):
+    ingredients: str
+    user_id: str
 
-# Define the slash command
-@bot.tree.command(name="findrecipe", description="Find recipes based on ingredients")
-async def find_recipe(interaction: discord.Interaction, ingredients: str):
-    await interaction.response.defer(thinking=True)
+# Your Discord public key from the Developer Portal
+DISCORD_PUBLIC_KEY = os.getenv("DISCORD_PUBLIC_KEY")
+
+@app.post("/api/discord-interactions")
+async def discord_interactions(request: Request):
+    # Get the signature and timestamp from the headers
+    signature = request.headers.get('X-Signature-Ed25519')
+    timestamp = request.headers.get('X-Signature-Timestamp')
+    
+    # Get the request body as bytes
+    body = await request.body()
+    
+    # Verify the request
+    if not signature or not timestamp:
+        raise HTTPException(status_code=401, detail="Invalid request signature")
     
     try:
-        # Call FastAPI backend
-        response = requests.post(
-            f"{FASTAPI_URL}/api/findrecipe",
-            json={"ingredients": ingredients, "user_id": str(interaction.user.id)}
-        )
-        response.raise_for_status()
-        recipes = response.json()
+        # Create a verify key using your Discord application's public key
+        verify_key = nacl.signing.VerifyKey(bytes.fromhex(DISCORD_PUBLIC_KEY))
         
-        if not recipes:
-            await interaction.followup.send("No recipes found with those ingredients. Try different ingredients!")
-            return
+        # Verify the signature
+        verify_key.verify(f"{timestamp}".encode() + body, bytes.fromhex(signature))
         
-        # Format and send the first recipe
-        recipe = recipes[0]  # Get the first recipe
+        # Parse the request body as JSON
+        data = await request.json()
         
-        embed = discord.Embed(
-            title=recipe["title"],
-            description=f"Uses {recipe['usedIngredientCount']} of your ingredients",
-            color=discord.Color.green()
-        )
+        # Respond to Discord's ping
+        if data.get("type") == 1:  # PING
+            return {"type": 1}  # PONG
+            
+        # Handle slash commands
+        if data.get("type") == 2:  # APPLICATION_COMMAND
+            command_name = data.get("data", {}).get("name")
+            
+            # Handle the findrecipe command
+            if command_name == "findrecipe":
+                # Extract options (ingredients)
+                options = data.get("data", {}).get("options", [])
+                ingredients = ""
+                for option in options:
+                    if option.get("name") == "ingredients":
+                        ingredients = option.get("value", "")
+                
+                user_id = data.get("member", {}).get("user", {}).get("id", "unknown")
+                
+                # Call the recipe search function
+                try:
+                    # Use ingredients directly instead of RecipeRequest
+                    recipes = await search_recipes_by_ingredients(ingredients)
+                    
+                    if not recipes:
+                        return {
+                            "type": 4,  # CHANNEL_MESSAGE_WITH_SOURCE
+                            "data": {
+                                "content": "No recipes found with those ingredients. Try different ingredients!"
+                            }
+                        }
+                    
+                    # Format the response
+                    recipe = recipes[0]  # Get the first recipe
+                    
+                    # Get detailed recipe info
+                    detailed_recipe = await get_recipe_information(recipe['id'])
+                    
+                    # Format instructions
+                    instructions = detailed_recipe.get("instructions", "No instructions available.")
+                    if len(instructions) > 1800:  # Discord has a 2000 char limit
+                        instructions = instructions[:1800] + "..."
+                    
+                    # Create the response
+                    response = {
+                        "type": 4,  # CHANNEL_MESSAGE_WITH_SOURCE
+                        "data": {
+                            "embeds": [
+                                {
+                                    "title": recipe["title"],
+                                    "description": f"Uses {recipe.get('usedIngredientCount', 0)} of your ingredients",
+                                    "color": 3066993,  # Green color
+                                    "thumbnail": {"url": recipe.get("image", "")},
+                                    "fields": [
+                                        {
+                                            "name": "Missing Ingredients",
+                                            "value": ", ".join([ing["name"] for ing in recipe.get("missedIngredients", [])]) or "None",
+                                            "inline": False
+                                        },
+                                        {
+                                            "name": "Instructions",
+                                            "value": instructions,
+                                            "inline": False
+                                        }
+                                    ],
+                                    "footer": {
+                                        "text": f"Recipe ID: {recipe['id']} | React with 👍 to save this recipe to your favorites"
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                    
+                    return response
+                    
+                except Exception as e:
+                    return {
+                        "type": 4,  # CHANNEL_MESSAGE_WITH_SOURCE
+                        "data": {
+                            "content": f"Error finding recipes: {str(e)}"
+                        }
+                    }
         
-        if "image" in recipe:
-            embed.set_thumbnail(url=recipe["image"])
-        
-        embed.add_field(name="Missing Ingredients", value=", ".join([ing["name"] for ing in recipe.get("missedIngredients", [])]), inline=False)
-        
-        # Get detailed recipe information
-        detailed_recipe = requests.get(
-            f"{FASTAPI_URL}/api/recipe/{recipe['id']}"
-        ).json()
-        
-        if "instructions" in detailed_recipe:
-            # Truncate instructions if too long
-            instructions = detailed_recipe["instructions"]
-            if len(instructions) > 1024:
-                instructions = instructions[:1021] + "..."
-            embed.add_field(name="Instructions", value=instructions, inline=False)
-        
-        embed.set_footer(text="React with 👍 to save this recipe to your favorites")
-        
-        message = await interaction.followup.send(embed=embed)
-        await message.add_reaction("👍")
-        
+        # Default response for other interaction types
+        return {
+            "type": 4,
+            "data": {
+                "content": "Received your command, but I'm not sure how to handle it."
+            }
+        }
+    
+    except nacl.exceptions.BadSignatureError:
+        raise HTTPException(status_code=401, detail="Invalid request signature")
     except Exception as e:
-        await interaction.followup.send(f"Error finding recipes: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
 
-# Run the bot
-bot.run(DISCORD_TOKEN)
+# In-memory storage for favorite recipes (will be replaced with Kafka in Sprint 3)
+favorite_recipes = {}
+
+@app.post("/api/findrecipe")
+async def find_recipe(request: RecipeRequest):
+    """Find recipes based on provided ingredients"""
+    try:
+        # Call the Spoonacular API
+        recipes = await search_recipes_by_ingredients(request.ingredients)
+        return recipes
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/recipe/{recipe_id}")
+async def get_recipe(recipe_id: int):
+    """Get detailed information for a specific recipe"""
+    try:
+        recipe = await get_recipe_information(recipe_id)
+        return recipe
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/favorites/add")
+async def add_favorite(recipe_data: Dict[str, Any], user_id: str):
+    """Save a recipe to user's favorites"""
+    if user_id not in favorite_recipes:
+        favorite_recipes[user_id] = []
+    
+    # Check if recipe already exists in favorites
+    if not any(recipe["id"] == recipe_data["id"] for recipe in favorite_recipes[user_id]):
+        favorite_recipes[user_id].append(recipe_data)
+    
+    return {"status": "success", "message": "Recipe added to favorites"}
+
+@app.get("/api/favorites/{user_id}")
+async def get_favorites(user_id: str):
+    """Get a user's favorite recipes"""
+    if user_id not in favorite_recipes:
+        return []
+    return favorite_recipes[user_id]

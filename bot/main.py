@@ -1,159 +1,120 @@
-from fastapi import FastAPI, Request, HTTPException, Depends
-from fastapi.responses import JSONResponse
-import uvicorn
-import hmac
-import hashlib
+import os
+import discord
+from discord import app_commands
+from discord.ext import commands
+import requests
 import json
-import time
-from pydantic import BaseModel
-from typing import List, Dict, Any, Optional
-import os
+from dotenv import load_dotenv
 
-import config
-from config import validate_config
+# Load environment variables
+load_dotenv()
 
-# Initialize FastAPI app
-app = FastAPI(title="Discord Bot API")
+# Bot setup
+DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
+BOT_PREFIX = "!"
+FASTAPI_URL = "http://localhost:8000"  # Your FastAPI server URL
 
-# Verify Discord signature
-async def verify_signature(request: Request):
-    # Get Discord signature and timestamp
-    signature = request.headers.get('X-Signature-Ed25519')
-    timestamp = request.headers.get('X-Signature-Timestamp')
-    
-    if not signature or not timestamp:
-        raise HTTPException(status_code=401, detail="Missing signature or timestamp")
-    
-    # Get raw request body
-    body = await request.body()
-    
-    # Verify signature
-    message = timestamp.encode() + body
+intents = discord.Intents.default()
+intents.message_content = True
+intents.reactions = True
+bot = commands.Bot(command_prefix=BOT_PREFIX, intents=intents)
+
+@bot.event
+async def on_ready():
+    print(f'{bot.user} has connected to Discord!')
+    try:
+        synced = await bot.tree.sync()
+        print(f"Synced {len(synced)} command(s)")
+    except Exception as e:
+        print(f"Failed to sync commands: {e}")
+
+# Define the slash command
+@bot.tree.command(name="findrecipe", description="Find recipes based on ingredients")
+async def find_recipe(interaction: discord.Interaction, ingredients: str):
+    await interaction.response.defer(thinking=True)
     
     try:
-        # Convert hex strings to bytes
-        signature_bytes = bytes.fromhex(signature)
-        public_key_bytes = bytes.fromhex(config.DISCORD_PUBLIC_KEY)
+        # Call FastAPI backend
+        response = requests.post(
+            f"{FASTAPI_URL}/api/findrecipe",
+            json={"ingredients": ingredients, "user_id": str(interaction.user.id)}
+        )
+        response.raise_for_status()
+        recipes = response.json()
         
-        # Use nacl's verify_key to verify the signature
-        import nacl.signing
-        verify_key = nacl.signing.VerifyKey(public_key_bytes)
-        verify_key.verify(message, signature_bytes)
+        if not recipes:
+            await interaction.followup.send("No recipes found with those ingredients. Try different ingredients!")
+            return
         
-        return await request.json()
+        # Format and send the first recipe
+        recipe = recipes[0]  # Get the first recipe
+        
+        embed = discord.Embed(
+            title=recipe["title"],
+            description=f"Uses {recipe['usedIngredientCount']} of your ingredients",
+            color=discord.Color.green()
+        )
+        
+        if "image" in recipe:
+            embed.set_thumbnail(url=recipe["image"])
+        
+        embed.add_field(name="Missing Ingredients", value=", ".join([ing["name"] for ing in recipe.get("missedIngredients", [])]), inline=False)
+        
+        # Get detailed recipe information
+        detailed_recipe = requests.get(
+            f"{FASTAPI_URL}/api/recipe/{recipe['id']}"
+        ).json()
+        
+        if "instructions" in detailed_recipe:
+            # Truncate instructions if too long
+            instructions = detailed_recipe["instructions"]
+            if len(instructions) > 1024:
+                instructions = instructions[:1021] + "..."
+            embed.add_field(name="Instructions", value=instructions, inline=False)
+        
+        # Add recipe ID to footer for later reference
+        embed.set_footer(text=f"Recipe ID: {recipe['id']} | React with 👍 to save this recipe to your favorites")
+        
+        message = await interaction.followup.send(embed=embed)
+        await message.add_reaction("👍")
+        
     except Exception as e:
-        raise HTTPException(status_code=401, detail=f"Invalid signature: {str(e)}")
+        await interaction.followup.send(f"Error finding recipes: {str(e)}")
 
-@app.get("/")
-async def root():
-    """Health check endpoint."""
-    return {"status": "ok", "message": "Discord bot API is running"}
+@bot.event
+async def on_reaction_add(reaction, user):
+    # Ignore bot's own reactions
+    if user.id == bot.user.id:
+        return
+    
+    # Check if the reaction is 👍 on a recipe message
+    if str(reaction.emoji) == "👍" and reaction.message.author.id == bot.user.id:
+        try:
+            # Extract recipe data from the embed
+            embed = reaction.message.embeds[0]
+            recipe_title = embed.title
+            
+            # Extract recipe ID from footer
+            footer_text = embed.footer.text
+            recipe_id = None
+            if "Recipe ID:" in footer_text:
+                recipe_id = footer_text.split("Recipe ID:")[1].split("|")[0].strip()
+            
+            if recipe_id:
+                response = requests.get(f"{FASTAPI_URL}/api/recipe/{recipe_id}")
+                recipe_data = response.json()
+                
+                requests.post(
+                    f"{FASTAPI_URL}/api/favorites/add",
+                    json=recipe_data,
+                    params={"user_id": str(user.id)}
+                )
+                
+                # Notify the user
+                await user.send(f"Added '{recipe_title}' to your favorites!")
+        except Exception as e:
+            print(f"Error saving favorite: {e}")
 
-@app.post("/interactions")
-async def interactions(data: dict = Depends(verify_signature)):
-    """Handle Discord interactions."""
-    
-    # Log the incoming data for debugging
-    print(f"Received interaction: {data}")
-    
-    # Interaction type 1: PING (used by Discord to verify the endpoint)
-    if data.get("type") == 1:
-        print("Responding to PING with PONG")
-        return JSONResponse(content={"type": 1})  # Type 1: PONG response
-    
-    # Interaction type 2: APPLICATION_COMMAND (slash commands)
-    elif data.get("type") == 2:
-        command_name = data.get("data", {}).get("name", "")
-        
-        if command_name == "ping":
-            return JSONResponse(content={
-                "type": 4,  # Type 4: Channel message with source
-                "data": {
-                    "content": "Pong! Bot is working correctly."
-                }
-            })
-        
-        # Default response for unknown commands
-        return JSONResponse(content={
-            "type": 4,
-            "data": {
-                "content": f"Command '{command_name}' received but not implemented yet."
-            }
-        })
-    
-    # Default response for other interaction types
-    return JSONResponse(content={
-        "type": 4,
-        "data": {
-            "content": "Interaction received but not supported."
-        }
-    })
-
-def start_api():
-    """Start the FastAPI server."""
-    # Validate configuration
-    validate_config()
-    
-    # Start the server
-    uvicorn.run(
-        "main:app",
-        host=config.API_HOST,
-        port=config.API_PORT,
-        reload=True
-    )
-
+# Only run the bot when this file is executed directly
 if __name__ == "__main__":
-    start_api()
-
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-from typing import List, Dict, Any, Optional
-import os
-
-app = FastAPI()
-
-# Define the request model
-class RecipeRequest(BaseModel):
-    ingredients: str
-    user_id: str
-
-# In-memory storage for favorite recipes (will be replaced with Kafka in Sprint 3)
-favorite_recipes = {}
-
-@app.post("/api/findrecipe")
-async def find_recipe(request: RecipeRequest):
-    """Find recipes based on provided ingredients"""
-    try:
-        # Call the Spoonacular API
-        recipes = await search_recipes_by_ingredients(request.ingredients)
-        return recipes
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/api/recipe/{recipe_id}")
-async def get_recipe(recipe_id: int):
-    """Get detailed information for a specific recipe"""
-    try:
-        recipe = await get_recipe_information(recipe_id)
-        return recipe
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/api/favorites/add")
-async def add_favorite(recipe_data: Dict[str, Any], user_id: str):
-    """Save a recipe to user's favorites"""
-    if user_id not in favorite_recipes:
-        favorite_recipes[user_id] = []
-    
-    # Check if recipe already exists in favorites
-    if not any(recipe["id"] == recipe_data["id"] for recipe in favorite_recipes[user_id]):
-        favorite_recipes[user_id].append(recipe_data)
-    
-    return {"status": "success", "message": "Recipe added to favorites"}
-
-@app.get("/api/favorites/{user_id}")
-async def get_favorites(user_id: str):
-    """Get a user's favorite recipes"""
-    if user_id not in favorite_recipes:
-        return []
-    return favorite_recipes[user_id]
+    bot.run(DISCORD_TOKEN)
