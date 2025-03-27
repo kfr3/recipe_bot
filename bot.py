@@ -1,33 +1,52 @@
-import os
-import discord
-from discord.ext import commands
-from dotenv import load_dotenv
+import requests
+import json
+import time
+import config
+from config import validate_config
 
-load_dotenv()
-
-intents = discord.Intents.default()
-intents.message_content = True
-intents.messages = True  # Allow the bot to receive message events
-intents.guilds = True    # Allow the bot to interact with guilds
-
-bot = commands.Bot(command_prefix="/", intents=intents)
-
-@bot.event
-async def on_ready():
-    print(f'Logged in as {bot.user}')
-    try:
-        synced = await bot.tree.sync()  # Sync slash commands
-        print(f'Synced {len(synced)} commands')
-    except Exception as e:
-        print(f'Failed to sync commands: {e}')
-
-@bot.tree.command(name="ping", description="Responds with Pong!")
-async def ping(interaction: discord.Interaction):
-    await interaction.response.send_message("Pong!")
-
-# Get bot token from environment variable and run bot
-bot_token = os.getenv("DISCORD_BOT_TOKEN")
-if not bot_token:
-    raise ValueError("Bot token not found. Please set the DISCORD_BOT_TOKEN environment variable.")
+def register_commands():
+    """Register slash commands with Discord."""
+    # Validate configuration
+    validate_config()
     
-bot.run(bot_token)
+    # Define the commands to register
+    commands = [
+        {
+            "name": "ping",
+            "description": "Check if the bot is working",
+            "type": 1  # CHAT_INPUT
+        }
+    ]
+    
+    # Discord API endpoint for registering global commands
+    url = f"https://discord.com/api/v10/applications/{config.DISCORD_APP_ID}/commands"
+    
+    # Set up headers with authorization
+    headers = {
+        "Authorization": f"Bot {config.DISCORD_BOT_TOKEN}",
+        "Content-Type": "application/json"
+    }
+    
+    # Register each command
+    for command in commands:
+        response = requests.post(url, headers=headers, json=command)
+        
+        if response.status_code in (200, 201):
+            print(f"Successfully registered command: {command['name']}")
+        else:
+            print(f"Failed to register command {command['name']}: {response.status_code}")
+            try:
+                print(f"Error: {response.json()}")
+            except:
+                print(f"Response: {response.text}")
+
+def main():
+    """Main function to set up the Discord bot."""
+    print("Registering Discord commands...")
+    register_commands()
+    print("Commands registered. You can now start the FastAPI server using 'python main.py'")
+    print("Then, expose it using ngrok with 'ngrok http 8000'")
+    print("Finally, update your Discord application's interactions endpoint URL in the Developer Portal")
+
+if __name__ == "__main__":
+    main()
