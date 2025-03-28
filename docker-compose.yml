@@ -1,0 +1,87 @@
+version: '3'
+
+services:
+  zookeeper:
+    image: bitnami/zookeeper:latest
+    ports:
+      - "2181:2181"
+    environment:
+      - ALLOW_ANONYMOUS_LOGIN=yes
+    networks:
+      - recipe-network
+
+  kafka:
+    image: bitnami/kafka:latest
+    ports:
+      - "9092:9092"
+    environment:
+      - KAFKA_BROKER_ID=1
+      - KAFKA_CFG_LISTENERS=PLAINTEXT://:9092
+      - KAFKA_CFG_ADVERTISED_LISTENERS=PLAINTEXT://localhost:9092
+      - KAFKA_CFG_ZOOKEEPER_CONNECT=zookeeper:2181
+      - ALLOW_PLAINTEXT_LISTENER=yes
+      - KAFKA_CFG_AUTO_CREATE_TOPICS_ENABLE=true
+    depends_on:
+      - zookeeper
+    networks:
+      - recipe-network
+
+  # Kafka UI for monitoring (optional but helpful)
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    ports:
+      - "8081:8080"
+    environment:
+      - KAFKA_CLUSTERS_0_NAME=local
+      - KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS=kafka:9092
+      - KAFKA_CLUSTERS_0_ZOOKEEPER=zookeeper:2181
+    depends_on:
+      - kafka
+    networks:
+      - recipe-network
+      
+  # FastAPI service
+  fastapi:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    ports:
+      - "8000:8000"
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - DISCORD_PUBLIC_KEY=${DISCORD_PUBLIC_KEY}
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+    depends_on:
+      - kafka
+    networks:
+      - recipe-network
+
+  # Discord bot service
+  discord-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile.bot
+    environment:
+      - DISCORD_TOKEN=${DISCORD_TOKEN}
+      - FASTAPI_URL=http://fastapi:8000
+    depends_on:
+      - fastapi
+    networks:
+      - recipe-network
+
+  # Ngrok to expose the API to the internet
+  ngrok:
+    image: wernight/ngrok
+    ports:
+      - "4040:4040"
+    environment:
+      - NGROK_AUTH=${NGROK_AUTH_TOKEN}
+      - NGROK_PORT=fastapi:8000
+    depends_on:
+      - fastapi
+    networks:
+      - recipe-network
+
+networks:
+  recipe-network:
+    driver: bridge
